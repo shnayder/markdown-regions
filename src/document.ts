@@ -18,13 +18,20 @@ type AstNode = any;
 
 const processor = unified().use(remarkParse).use(remarkGfm);
 
+// Anchor comment format: <!-- mdr:id=<slug> -->. Stable IDs must match the
+// format before they take effect — anything else is just a regular HTML comment.
+const ANCHOR_RE = /^<!--\s*mdr:id=([a-z0-9][a-z0-9-]*)\s*-->$/;
+
 export class Document {
   #source: string;
   #ast: AstNode;
+  #tree: RegionNode;
 
   private constructor(source: string) {
     this.#source = source;
     this.#ast = processor.parse(source);
+    this.#tree = this.#build_tree();
+    validate_stable_ids(this.#tree);
   }
 
   static from_string(source: string): Document {
@@ -35,7 +42,16 @@ export class Document {
     return this.#source;
   }
 
-  list_regions(_opts?: { root?: string; depth?: number }): RegionNode {
+  list_regions(opts?: { root?: string; depth?: number }): RegionNode {
+    const root_id = opts?.root ?? "";
+    const subtree = root_id === "" ? this.#tree : find_region(this.#tree, root_id);
+    if (!subtree) {
+      throw new Error(`region not found: ${JSON.stringify(root_id)}`);
+    }
+    return opts?.depth !== undefined ? truncate_depth(subtree, opts.depth) : subtree;
+  }
+
+  #build_tree(): RegionNode {
     const children = collect_regions(this.#ast.children, 0, "", this.#source);
     return {
       id: "",
@@ -68,6 +84,7 @@ function collect_regions(
       // Section: span until next heading of equal/lesser depth.
       const section_depth: number = node.depth;
       const title = heading_text(node);
+      const stable_id = stable_id_in_heading(node);
 
       let j = i + 1;
       while (j < nodes.length) {
@@ -90,6 +107,7 @@ function collect_regions(
 
       result.push({
         id: path,
+        ...(stable_id ? { stable_id } : {}),
         type: "section",
         title,
         hash: "",
@@ -105,11 +123,12 @@ function collect_regions(
     if (node.type === "table") {
       const id = `${parent_path}#table-${table_idx}`;
       table_idx++;
-      const start = node.position?.start.offset ?? 0;
-      const end = node.position?.end.offset ?? start;
+      const stable_id = preceding_anchor_id(nodes, i);
+      const { start, end } = region_extent_with_anchor(nodes, i, stable_id !== undefined);
       const content = source.slice(start, end);
       result.push({
         id,
+        ...(stable_id ? { stable_id } : {}),
         type: "table",
         title: null,
         hash: "",
@@ -124,11 +143,12 @@ function collect_regions(
     if (node.type === "code") {
       const id = `${parent_path}#code-${code_idx}`;
       code_idx++;
-      const start = node.position?.start.offset ?? 0;
-      const end = node.position?.end.offset ?? start;
+      const stable_id = preceding_anchor_id(nodes, i);
+      const { start, end } = region_extent_with_anchor(nodes, i, stable_id !== undefined);
       const content = source.slice(start, end);
       result.push({
         id,
+        ...(stable_id ? { stable_id } : {}),
         type: "code",
         title: node.lang ?? null,
         hash: "",
@@ -140,14 +160,87 @@ function collect_regions(
       continue;
     }
 
-    // Paragraphs, lists, blockquotes, etc. are not regions — skip.
+    // Paragraphs, lists, blockquotes, raw HTML (incl. anchor comments), etc.
+    // are not regions on their own — skip.
     i++;
   }
   return result;
 }
 
+function stable_id_in_heading(heading: AstNode): string | undefined {
+  for (const child of heading.children ?? []) {
+    if (child.type !== "html") continue;
+    const m = String(child.value ?? "").trim().match(ANCHOR_RE);
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+function preceding_anchor_id(nodes: AstNode[], i: number): string | undefined {
+  if (i === 0) return undefined;
+  const prev = nodes[i - 1];
+  if (prev.type !== "html") return undefined;
+  const m = String(prev.value ?? "").trim().match(ANCHOR_RE);
+  return m ? m[1] : undefined;
+}
+
+// When a table/code block has a preceding anchor line, the anchor is part of
+// the region's canonical source — extend the region's start offset to cover it.
+function region_extent_with_anchor(
+  nodes: AstNode[],
+  i: number,
+  has_anchor: boolean,
+): { start: number; end: number } {
+  const node = nodes[i];
+  const node_start = node.position?.start.offset ?? 0;
+  const node_end = node.position?.end.offset ?? node_start;
+  if (!has_anchor) return { start: node_start, end: node_end };
+  const prev = nodes[i - 1];
+  const start = prev.position?.start.offset ?? node_start;
+  return { start, end: node_end };
+}
+
+function find_region(tree: RegionNode, id: string): RegionNode | undefined {
+  if (tree.id === id || tree.stable_id === id) return tree;
+  for (const child of tree.children) {
+    const found = find_region(child, id);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function truncate_depth(node: RegionNode, depth: number): RegionNode {
+  if (depth <= 0) return { ...node, children: [] };
+  return {
+    ...node,
+    children: node.children.map((c) => truncate_depth(c, depth - 1)),
+  };
+}
+
+function validate_stable_ids(tree: RegionNode): void {
+  const seen = new Set<string>();
+  const walk = (node: RegionNode) => {
+    if (node.stable_id !== undefined) {
+      if (seen.has(node.stable_id)) {
+        throw new Error(`duplicate stable_id: ${node.stable_id}`);
+      }
+      seen.add(node.stable_id);
+    }
+    for (const child of node.children) walk(child);
+  };
+  walk(tree);
+}
+
 function heading_text(node: AstNode): string {
-  return (node.children ?? []).map(extract_text).join("");
+  const parts: string[] = [];
+  for (const child of node.children ?? []) {
+    if (
+      child.type === "html" &&
+      ANCHOR_RE.test(String(child.value ?? "").trim())
+    ) continue;
+    parts.push(extract_text(child));
+  }
+  return parts.join("").trim();
 }
 
 function extract_text(node: AstNode): string {
