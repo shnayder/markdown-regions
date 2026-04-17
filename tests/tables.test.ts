@@ -132,3 +132,109 @@ Deno.test("table write — wrong region type errors", () => {
   }
   assertEquals(threw, true);
 });
+
+Deno.test("insert_rows — insert at top (after_row = -1)", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_rows({
+    id: "#table-1",
+    after_row: -1,
+    rows: [["Zach", "done"]],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.rows, [
+    ["Zach", "done"],
+    ["Alice", "todo"],
+    ["Bob", "todo"],
+  ]);
+});
+
+Deno.test("insert_rows — append when after_row = rows.length", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_rows({
+    id: "#table-1",
+    after_row: 2,
+    rows: [["Carol", "todo"]],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.rows, [
+    ["Alice", "todo"],
+    ["Bob", "todo"],
+    ["Carol", "todo"],
+  ]);
+});
+
+Deno.test("insert_rows — insert multiple rows at once", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_rows({
+    id: "#table-1",
+    after_row: 0,
+    rows: [["Amelia", "todo"], ["Andrew", "done"]],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.rows, [
+    ["Alice", "todo"],
+    ["Amelia", "todo"],
+    ["Andrew", "done"],
+    ["Bob", "todo"],
+  ]);
+});
+
+Deno.test("insert_rows — out-of-range after_row errors", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  const r = doc.insert_rows({
+    id: "#table-1",
+    after_row: 99,
+    rows: [["x", "y"]],
+    expected_hash: hash,
+  });
+  assertEquals("error" in r, true);
+});
+
+Deno.test("delete_rows — remove one row", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.delete_rows({
+    id: "#table-1",
+    row_indices: [0],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.rows, [["Bob", "todo"]]);
+});
+
+Deno.test("delete_rows — remove multiple rows (indices processed atomically)", () => {
+  const src = `| N |
+|---|
+| 1 |
+| 2 |
+| 3 |
+| 4 |
+`;
+  const doc = Document.from_string(src);
+  const { hash } = doc.read_table("#table-1");
+  doc.delete_rows({
+    id: "#table-1",
+    row_indices: [0, 2],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.rows, [["2"], ["4"]]);
+});
+
+Deno.test("delete_rows — out-of-range index errors", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  const r = doc.delete_rows({
+    id: "#table-1",
+    row_indices: [99],
+    expected_hash: hash,
+  });
+  assertEquals("error" in r, true);
+});

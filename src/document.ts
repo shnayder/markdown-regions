@@ -532,6 +532,44 @@ export class Document {
     return this.#apply_table_grid(region, headers, new_rows);
   }
 
+  insert_rows(opts: {
+    id: string;
+    after_row: number;
+    rows: string[][];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    // Valid range: -1 through rows.length, inclusive.
+    if (opts.after_row < -1 || opts.after_row > rows.length) {
+      return { error: `after_row out of range: ${opts.after_row}` };
+    }
+    // Normalize each new row to the column count (pad with "", truncate extras).
+    const normalized = opts.rows.map((r) => headers.map((_, i) => r[i] ?? ""));
+    const new_rows = rows.slice();
+    new_rows.splice(opts.after_row + 1, 0, ...normalized);
+    return this.#apply_table_grid(region, headers, new_rows);
+  }
+
+  delete_rows(opts: {
+    id: string;
+    row_indices: number[];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    for (const r of opts.row_indices) {
+      if (r < 0 || r >= rows.length) {
+        return { error: `row out of range: ${r}` };
+      }
+    }
+    const drop = new Set(opts.row_indices);
+    const new_rows = rows.filter((_, i) => !drop.has(i));
+    return this.#apply_table_grid(region, headers, new_rows);
+  }
+
   update_headers(opts: {
     id: string;
     edits: { col: number; value: string }[];
