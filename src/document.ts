@@ -5,12 +5,22 @@ import remarkFrontmatter from "remark-frontmatter";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 
+/**
+ * Metadata for a single region as returned by `list_regions`.
+ * Tree-shaped: nested sections appear under `children`; tables and code blocks
+ * are always leaves (`children: []`).
+ */
 export interface RegionNode {
+  /** Slug-derived path (e.g. `installation/setup`, `#table-1`). Always present. */
   id: string;
+  /** Explicit anchor ID if the region has one; undefined otherwise. */
   stable_id?: string;
   type: "section" | "table" | "code";
+  /** Heading text for sections, language for code blocks, null for tables. */
   title: string | null;
+  /** SHA-256 of the canonical source, truncated to 16 hex chars. */
   hash: string;
+  /** Codepoint length of the region's editable content. */
   char_length: number;
   child_count: number;
   children: RegionNode[];
@@ -45,6 +55,7 @@ interface RegionData {
   ast_node: AstNode;
 }
 
+/** Return shape for `read_region`. `content` excludes the heading for sections. */
 export interface ReadRegionResult {
   title: string | null;
   content: string;
@@ -52,16 +63,22 @@ export interface ReadRegionResult {
   stable_id?: string;
 }
 
+/** Return shape for `read_table`. First-row = headers; remaining rows = data. */
 export interface ReadTableResult {
   headers: string[];
   rows: string[][];
   hash: string;
 }
 
+/** Success shape for most write ops: the region's new hash after the write. */
 export interface OkResult {
   hash: string;
 }
 
+/**
+ * Returned by a write when the `expected_hash` didn't match — the doc drifted
+ * since the caller's read. Carries the current state so the caller can replan.
+ */
 export interface ConflictResult {
   conflict: true;
   current_content: string;
@@ -69,8 +86,14 @@ export interface ConflictResult {
   region_still_exists: boolean;
 }
 
+/**
+ * Returned by `edit_region` when `find` is provided but doesn't resolve to
+ * exactly one occurrence. The doc did not change; the caller should revise
+ * the find string.
+ */
 export interface FindErrorResult {
   error: "find_not_found" | "find_ambiguous";
+  /** Populated on `find_ambiguous` (≥2); absent on `find_not_found`. */
   match_count?: number;
   current_content: string;
   current_hash: string;
@@ -78,17 +101,24 @@ export interface FindErrorResult {
 
 export type EditResult = OkResult | ConflictResult | FindErrorResult;
 
+/** Success shape for `insert_region`: the new region's slug id + hash. */
 export interface InsertOkResult {
   id: string;
   hash: string;
 }
 
+/** Non-concurrency failure: malformed input, wrong region type, duplicate id, etc. */
 export interface ErrorResult {
   error: string;
 }
 
 export type InsertResult = InsertOkResult | ConflictResult | ErrorResult;
 
+/**
+ * Conflict response for table ops — same semantics as `ConflictResult` but
+ * carries the parsed grid (`current_table`) instead of raw markdown, matching
+ * the shape of `read_table`.
+ */
 export interface TableConflictResult {
   conflict: true;
   current_table: { headers: string[]; rows: string[][] };
@@ -98,6 +128,16 @@ export interface TableConflictResult {
 
 export type TableWriteResult = OkResult | TableConflictResult | ErrorResult;
 
+/**
+ * In-memory markdown document with region-scoped read/write operations.
+ *
+ * The document is built from a string; every mutating op produces a new source
+ * (via offset-based splicing) and re-parses. Regions are addressed by slug or
+ * stable ID; the empty string `""` addresses the root.
+ *
+ * This class is filesystem-agnostic — use `FileDocument` / `open_document` to
+ * persist changes to disk.
+ */
 export class Document {
   #source!: string;
   // deno-lint-ignore no-explicit-any
@@ -110,6 +150,11 @@ export class Document {
     this.#parse(source);
   }
 
+  /**
+   * Re-parse `source` from scratch. Called on construction and after every
+   * mutating op. Normalizes line endings, rebuilds the region tree and
+   * lookup map, computes hashes, and validates stable-ID uniqueness.
+   */
   #parse(source: string): void {
     // Normalize line endings to \n on every parse so CRLF input (and edits
     // that splice CRLF back in) hash and round-trip identically to LF.
@@ -141,14 +186,22 @@ export class Document {
     validate_stable_ids(this.#tree);
   }
 
+  /** Construct a Document from raw markdown source. */
   static from_string(source: string): Document {
     return new Document(source);
   }
 
+  /** Return the current (canonicalized) markdown source. */
   to_string(): string {
     return this.#source;
   }
 
+  /**
+   * Return the region-metadata tree. By default returns the full document;
+   * `opts.root` scopes to a specific region (slug or stable ID; `""` = root),
+   * and `opts.depth` caps how many levels of children are included.
+   * Throws if `opts.root` doesn't resolve.
+   */
   list_regions(opts?: { root?: string; depth?: number }): RegionNode {
     const root_id = opts?.root ?? "";
     const subtree = root_id === "" ? this.#tree : find_region(this.#tree, root_id);
@@ -158,6 +211,14 @@ export class Document {
     return opts?.depth !== undefined ? truncate_depth(subtree, opts.depth) : subtree;
   }
 
+  /**
+   * Return `{title, content, hash, stable_id?}` for a region.
+   * - Sections: `title` is the heading text; `content` is everything after the heading line.
+   * - Code blocks: `title` is the language (null if unset); `content` is the fenced body.
+   * - Tables: `title` is null; `content` is the full source.
+   * - Root (`""`): `title` is null; `content` is the full document.
+   * Throws if `id` doesn't resolve.
+   */
   read_region(id: string): ReadRegionResult {
     if (id === "") {
       return { title: null, content: this.#root.content, hash: this.#root.hash };
@@ -175,6 +236,11 @@ export class Document {
     return out;
   }
 
+  /**
+   * Return the parsed grid for a pipe table: `{headers, rows, hash}`.
+   * Cells are plain text (inline formatting is stripped).
+   * Throws if `id` doesn't resolve or isn't a table.
+   */
   read_table(id: string): ReadTableResult {
     const region = this.#regions.get(id);
     if (!region) {
@@ -190,6 +256,16 @@ export class Document {
     };
   }
 
+  /**
+   * Replace text inside a region's editable content.
+   *
+   * With `find`: replaces the (exactly-once) substring with `replacement`.
+   * Without `find`: replaces the region's whole body (heading preserved for
+   * sections, fence preserved for code blocks).
+   *
+   * Hash check fires before find resolution: a `Conflict` means the doc drifted,
+   * a `FindError` means the doc is current but the find string didn't match.
+   */
   edit_region(opts: {
     id: string;
     find?: string;
@@ -237,6 +313,10 @@ export class Document {
     return { hash: updated.hash };
   }
 
+  /**
+   * Append `content` to the end of the region's editable body.
+   * Applies to sections, code blocks, and root; tables throw (use `insert_rows`).
+   */
   append_region(opts: {
     id: string;
     content: string;
@@ -245,6 +325,11 @@ export class Document {
     return this.#at_boundary(opts.id, opts.expected_hash, "end", opts.content);
   }
 
+  /**
+   * Insert `content` at the start of the region's editable body (after the
+   * heading for sections; inside the opening fence for code blocks).
+   * Tables throw.
+   */
   prepend_region(opts: {
     id: string;
     content: string;
@@ -253,6 +338,7 @@ export class Document {
     return this.#at_boundary(opts.id, opts.expected_hash, "start", opts.content);
   }
 
+  /** Shared body of `append_region` / `prepend_region`. */
   #at_boundary(
     id: string,
     expected_hash: string,
@@ -297,6 +383,20 @@ export class Document {
     return { hash: updated ? updated.hash : this.#root.hash };
   }
 
+  /**
+   * Create a new region as a child of `parent_id` (root if omitted/`""`).
+   *
+   * `content` must begin with exactly one top-level region — a heading, pipe
+   * table, or fenced code block. For section content, heading depths are
+   * normalized so the leading heading lands at `parent_depth + 1`, with
+   * interior headings shifted by the same delta.
+   *
+   * Optional `after_child_id` places the new region after that specific
+   * sibling; omit to insert as the first child.
+   *
+   * Optional `stable_id` stamps an anchor on the new region at creation time,
+   * equivalent to a follow-up `stabilize_region`.
+   */
   insert_region(opts: {
     parent_id?: string;
     after_child_id?: string;
@@ -447,6 +547,16 @@ export class Document {
     return { error: "insert succeeded but new region could not be located" };
   }
 
+  /**
+   * Change a region's title in place.
+   * - Sections: rewrite the heading text. Slug changes, descendant slug IDs
+   *   cascade; stable IDs are preserved.
+   * - Code blocks: set the fence language. Pass `""` to clear.
+   * - Tables or root: `Error` (no title to set).
+   *
+   * The returned `id` is the region's current slug after the op; for sections
+   * it may differ from the input `id`.
+   */
   set_title(opts: {
     id: string;
     title: string;
@@ -518,6 +628,11 @@ export class Document {
     return { error: "set_title succeeded but new region could not be located" };
   }
 
+  /**
+   * Apply a batch of cell edits to a table. All `{row, col}` indices are
+   * validated up front — any out-of-range index causes the entire batch to
+   * be rejected with no partial application.
+   */
   update_cells(opts: {
     id: string;
     edits: { row: number; col: number; value: string }[];
@@ -539,6 +654,11 @@ export class Document {
     return this.#apply_table_grid(region, headers, new_rows);
   }
 
+  /**
+   * Insert one or more rows after `after_row` (valid range: `-1` through
+   * current row count). `-1` inserts at the top; `rows.length` appends.
+   * Each new row is padded/truncated to the table's column count.
+   */
   insert_rows(opts: {
     id: string;
     after_row: number;
@@ -559,6 +679,11 @@ export class Document {
     return this.#apply_table_grid(region, headers, new_rows);
   }
 
+  /**
+   * Insert one or more columns after `after_col` (valid range: `-1` through
+   * current column count). `cells` supplies per-row values for the new columns;
+   * if omitted, new cells default to the empty string.
+   */
   insert_columns(opts: {
     id: string;
     after_col: number;
@@ -586,6 +711,10 @@ export class Document {
     return this.#apply_table_grid(region, new_headers, new_rows);
   }
 
+  /**
+   * Remove columns at the given indices. All indices are validated up front;
+   * any out-of-range index rejects the whole op.
+   */
   delete_columns(opts: {
     id: string;
     col_indices: number[];
@@ -605,6 +734,10 @@ export class Document {
     return this.#apply_table_grid(region, new_headers, new_rows);
   }
 
+  /**
+   * Remove rows at the given indices. All indices are validated up front;
+   * any out-of-range index rejects the whole op.
+   */
   delete_rows(opts: {
     id: string;
     row_indices: number[];
@@ -623,6 +756,10 @@ export class Document {
     return this.#apply_table_grid(region, headers, new_rows);
   }
 
+  /**
+   * Update header cells. Semantically distinct from `update_cells` since
+   * headers and data rows play different structural roles.
+   */
   update_headers(opts: {
     id: string;
     edits: { col: number; value: string }[];
@@ -641,6 +778,11 @@ export class Document {
     return this.#apply_table_grid(region, new_headers, rows);
   }
 
+  /**
+   * Shared prelude for table write ops: resolves the id, verifies it's a
+   * table, checks the hash, and returns the current grid. On failure returns
+   * the appropriate Conflict/Error; callers can pass that through unchanged.
+   */
   #resolve_table(
     id: string,
     expected_hash: string,
@@ -668,6 +810,10 @@ export class Document {
     return { region, headers, rows };
   }
 
+  /**
+   * Re-serialize a table grid to markdown and splice it back into the source.
+   * Preserves alignment info; whitespace/column-padding may be normalized.
+   */
   #apply_table_grid(
     region: RegionData,
     headers: string[],
@@ -686,6 +832,12 @@ export class Document {
     return { hash: updated ? updated.hash : this.#root.hash };
   }
 
+  /**
+   * Stamp (or rewrite) the anchor comment on a region so subsequent calls can
+   * address it by `stable_id`. Default `stable_id` is the region's slug leaf.
+   * No-op when the requested value equals the current one. Errors on
+   * collision, invalid format, or root.
+   */
   stabilize_region(opts: {
     id: string;
     stable_id?: string;
@@ -762,6 +914,10 @@ export class Document {
     return { stable_id: target, hash: updated.hash };
   }
 
+  /**
+   * Root-specific path for `edit_region`: the whole document source is the
+   * editable content. Same find/whole-body + Conflict/FindError semantics.
+   */
   #edit_root(opts: {
     find?: string;
     replacement: string;
@@ -788,18 +944,22 @@ export class Document {
   }
 }
 
+/** Compute the canonical 16-hex-char region hash: SHA-256 of UTF-8, truncated. */
 function compute_hash(canonical: string): string {
   const digest = sha256(new TextEncoder().encode(canonical));
   return bytesToHex(digest).slice(0, 16);
 }
 
+/** Immutable string splice: replace `[start, end)` with `replacement`. */
 function splice(source: string, start: number, end: number, replacement: string): string {
   return source.slice(0, start) + replacement + source.slice(end);
 }
 
-// Apply find/replace or whole-body substitution, surfacing FindError cases.
-// Returns the new content on success, or { error, match_count? } on failure —
-// the caller adds current_content/current_hash from the region.
+/**
+ * Decide what the region's new content should be, given a find/replace spec.
+ * Returns `{new_content}` on success, or a FindError descriptor on failure;
+ * the caller attaches `current_content` / `current_hash` from the region.
+ */
 function resolve_new_content(
   content: string,
   opts: { find?: string; replacement: string },
@@ -818,6 +978,7 @@ function resolve_new_content(
   };
 }
 
+/** Count non-overlapping occurrences of `needle` in `haystack`. */
 function count_occurrences(haystack: string, needle: string): number {
   if (needle === "") return 0;
   let count = 0;
@@ -829,9 +990,12 @@ function count_occurrences(haystack: string, needle: string): number {
   return count;
 }
 
-// Shift the depth of every ATX heading in `content` by `delta`. Applied at
-// line start with a trailing space or line end (so a bare '#tag' inline isn't
-// touched). Depth is clamped to [1, 6].
+/**
+ * Shift the depth of every ATX heading in `content` by `delta`, clamped to
+ * [1, 6]. Used by `insert_region` to normalize heading levels to the parent
+ * section's depth. Only matches `#` runs at line start followed by space or
+ * end-of-line, so inline `#tag` text isn't affected.
+ */
 function shift_heading_levels(content: string, delta: number): string {
   return content.replace(/^(#{1,6})(?=[ \t]|$)/gm, (_m, hashes: string) => {
     const new_depth = Math.max(1, Math.min(6, hashes.length + delta));
@@ -839,8 +1003,11 @@ function shift_heading_levels(content: string, delta: number): string {
   });
 }
 
-// Inject an anchor comment. For section content, append to the first heading
-// line. For tables and code blocks, prepend on its own line.
+/**
+ * Inject an anchor comment into content being inserted via `insert_region`.
+ * For sections, appended to the first heading line; for tables and code
+ * blocks, prepended as its own line immediately before the region.
+ */
 function inject_anchor(
   content: string,
   stable_id: string,
@@ -856,6 +1023,13 @@ function inject_anchor(
   return `${anchor}\n${content}`;
 }
 
+/**
+ * Walk a flat list of AST block nodes and produce the region tree rooted at
+ * the current scope. Collects sections (depth > parent_depth), tables, and
+ * code blocks; registers each region in `registry` keyed by both slug ID and
+ * (when present) stable ID. Recurses into section bodies; `scope_end` bounds
+ * how far a section's content can extend when it's the last sibling.
+ */
 function collect_regions(
   nodes: AstNode[],
   parent_depth: number,
@@ -1017,11 +1191,16 @@ function collect_regions(
   return result;
 }
 
+/** Index a region under both its slug id and (if any) its stable id. */
 function register(registry: Map<string, RegionData>, data: RegionData): void {
   registry.set(data.id, data);
   if (data.stable_id !== undefined) registry.set(data.stable_id, data);
 }
 
+/**
+ * Render a parsed grid back to a GFM pipe table. Preserves column alignment
+ * but not original whitespace — cell padding is normalized to a single space.
+ */
 function serialize_table(
   headers: string[],
   rows: string[][],
@@ -1049,16 +1228,19 @@ function serialize_table(
   return lines.join("\n") + "\n";
 }
 
+/** Escape characters that would break a pipe-table cell. */
 function escape_cell(value: string): string {
   return value.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+/** Extract the header row from a GFM table AST node as plain-text cells. */
 function table_headers(table_node: AstNode): string[] {
   const rows = table_node.children ?? [];
   if (rows.length === 0) return [];
   return (rows[0].children ?? []).map((cell: AstNode) => extract_text(cell).trim());
 }
 
+/** Extract the data rows (everything after the header) as plain-text cells. */
 function table_rows(table_node: AstNode): string[][] {
   const rows = table_node.children ?? [];
   return rows.slice(1).map((row: AstNode) =>
@@ -1066,6 +1248,7 @@ function table_rows(table_node: AstNode): string[][] {
   );
 }
 
+/** Return the stable_id from a trailing anchor comment on a heading, if any. */
 function stable_id_in_heading(heading: AstNode): string | undefined {
   for (const child of heading.children ?? []) {
     if (child.type !== "html") continue;
@@ -1075,6 +1258,11 @@ function stable_id_in_heading(heading: AstNode): string | undefined {
   return undefined;
 }
 
+/**
+ * Return the stable_id from the HTML-comment block immediately preceding
+ * `nodes[i]`, if that comment matches the anchor format. Used to attach
+ * stable IDs to tables and code blocks.
+ */
 function preceding_anchor_id(nodes: AstNode[], i: number): string | undefined {
   if (i === 0) return undefined;
   const prev = nodes[i - 1];
@@ -1083,8 +1271,11 @@ function preceding_anchor_id(nodes: AstNode[], i: number): string | undefined {
   return m ? m[1] : undefined;
 }
 
-// When a table/code block has a preceding anchor line, the anchor is part of
-// the region's canonical source — extend the region's start offset to cover it.
+/**
+ * Compute the source extent for a table or code block, extending upward to
+ * include the preceding anchor line when present (the anchor is part of the
+ * region's canonical source and contributes to its hash).
+ */
 function region_extent_with_anchor(
   nodes: AstNode[],
   i: number,
@@ -1099,6 +1290,7 @@ function region_extent_with_anchor(
   return { start, end: node_end };
 }
 
+/** Locate a node in the region tree by slug id or stable id (depth-first). */
 function find_region(tree: RegionNode, id: string): RegionNode | undefined {
   if (tree.id === id || tree.stable_id === id) return tree;
   for (const child of tree.children) {
@@ -1108,6 +1300,10 @@ function find_region(tree: RegionNode, id: string): RegionNode | undefined {
   return undefined;
 }
 
+/**
+ * Return a copy of the tree pruned so children beyond `depth` are empty arrays.
+ * `depth=0` → just the root node; `depth=1` → root + direct children; etc.
+ */
 function truncate_depth(node: RegionNode, depth: number): RegionNode {
   if (depth <= 0) return { ...node, children: [] };
   return {
@@ -1116,6 +1312,7 @@ function truncate_depth(node: RegionNode, depth: number): RegionNode {
   };
 }
 
+/** Throw on any duplicate stable_id anywhere in the tree (validated on parse). */
 function validate_stable_ids(tree: RegionNode): void {
   const seen = new Set<string>();
   const walk = (node: RegionNode) => {
@@ -1130,6 +1327,7 @@ function validate_stable_ids(tree: RegionNode): void {
   walk(tree);
 }
 
+/** Extract a heading's visible text, stripping any trailing anchor comment. */
 function heading_text(node: AstNode): string {
   const parts: string[] = [];
   for (const child of node.children ?? []) {
@@ -1142,6 +1340,7 @@ function heading_text(node: AstNode): string {
   return parts.join("").trim();
 }
 
+/** Recursively concatenate text content of inline AST nodes. */
 function extract_text(node: AstNode): string {
   if (node.type === "text") return node.value;
   if (node.value) return node.value;
@@ -1149,6 +1348,7 @@ function extract_text(node: AstNode): string {
   return "";
 }
 
+/** Convert a heading's text to its raw slug: lowercase ASCII-alnum with `-` separators. */
 function slugify(title: string): string {
   return title
     .toLowerCase()
@@ -1156,8 +1356,11 @@ function slugify(title: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-// Per spec: if raw is already taken, try raw-2, raw-3, ... until a free slot.
-// The suffixed form may itself collide with a raw slug elsewhere, hence the loop.
+/**
+ * Make a raw slug unique against a set of already-used sibling slugs by
+ * appending `-N` (smallest N≥2). The suffixed form may itself collide with
+ * a pre-existing slug, which is why we loop upward until we hit a free slot.
+ */
 function disambiguate(raw: string, taken: Set<string>): string {
   if (!taken.has(raw)) return raw;
   let n = 2;
@@ -1165,6 +1368,7 @@ function disambiguate(raw: string, taken: Set<string>): string {
   return `${raw}-${n}`;
 }
 
+/** Count Unicode codepoints (not UTF-16 code units) in a string. */
 function codepoint_length(s: string): number {
   return Array.from(s).length;
 }
