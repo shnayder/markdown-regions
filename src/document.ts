@@ -502,6 +502,82 @@ export class Document {
     return { error: "set_title succeeded but new region could not be located" };
   }
 
+  stabilize_region(opts: {
+    id: string;
+    stable_id?: string;
+    expected_hash: string;
+  }): { stable_id: string; hash: string } | ConflictResult | ErrorResult {
+    if (opts.id === "") {
+      return { error: "root has no stable_id" };
+    }
+    const region = this.#regions.get(opts.id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(opts.id)}`);
+    }
+    if (region.hash !== opts.expected_hash) {
+      return {
+        conflict: true,
+        current_content: region.content,
+        current_hash: region.hash,
+        region_still_exists: true,
+      };
+    }
+    // Default stable_id: the region's slug leaf (last path segment after / or #).
+    const slug_leaf = opts.id.split(/[/#]/).pop() ?? opts.id;
+    const target = opts.stable_id ?? slug_leaf;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(target)) {
+      return { error: `invalid stable_id format: ${target}` };
+    }
+    // No-op when already stamped with the requested value.
+    if (region.stable_id === target) {
+      return { stable_id: target, hash: region.hash };
+    }
+    // Uniqueness: another region must not already claim this stable_id.
+    const existing = this.#regions.get(target);
+    if (existing && existing !== region) {
+      return { error: `stable_id already in use: ${target}` };
+    }
+    // Compute new source: rewrite the region's anchor.
+    let new_source: string;
+    if (region.type === "section") {
+      // Rebuild the heading line with (new) anchor.
+      const depth = region.ast_node.depth as number;
+      const title = region.title ?? "";
+      const new_line = `${"#".repeat(depth)} ${title} <!-- mdr:id=${target} -->`;
+      const line_start = region.ast_node.position?.start.offset ?? region.range_start;
+      const line_end = region.ast_node.position?.end.offset ?? region.content_range_start;
+      new_source = splice(this.#source, line_start, line_end, new_line);
+    } else {
+      // Table or code: either add an anchor line or replace the existing one.
+      const node_start = region.ast_node.position?.start.offset ?? region.range_start;
+      if (region.stable_id !== undefined) {
+        // Replace existing anchor line (which extends region.range_start .. node_start).
+        const anchor_start = region.range_start;
+        const anchor_end = node_start; // end of the anchor line, including its \n
+        new_source = splice(
+          this.#source,
+          anchor_start,
+          anchor_end,
+          `<!-- mdr:id=${target} -->\n`,
+        );
+      } else {
+        // Insert a new anchor line immediately before the region.
+        new_source = splice(
+          this.#source,
+          node_start,
+          node_start,
+          `<!-- mdr:id=${target} -->\n`,
+        );
+      }
+    }
+    this.#parse(new_source);
+    const updated = this.#regions.get(target);
+    if (!updated) {
+      return { error: "stabilize succeeded but new region could not be located" };
+    }
+    return { stable_id: target, hash: updated.hash };
+  }
+
   #edit_root(opts: {
     find?: string;
     replacement: string;

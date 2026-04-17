@@ -107,3 +107,91 @@ Deno.test("set_title — section hash changes after rename", () => {
   const after = doc.read_region("b").hash;
   assertNotEquals(before, after);
 });
+
+Deno.test("stabilize_region — default stable_id is the region's slug leaf", () => {
+  const doc = Document.from_string(`# Parent\n\n## Child\n\nbody\n`);
+  const { hash } = doc.read_region("parent/child");
+  const r = doc.stabilize_region({ id: "parent/child", expected_hash: hash });
+  assertEquals("stable_id" in r, true);
+  if ("stable_id" in r) assertEquals(r.stable_id, "child");
+  // Anchor stamped on the heading.
+  assertEquals(doc.to_string().includes("## Child <!-- mdr:id=child -->"), true);
+  // Resolves by stable ID now.
+  const after = doc.read_region("child");
+  assertEquals(after.stable_id, "child");
+});
+
+Deno.test("stabilize_region — explicit stable_id overrides the default", () => {
+  const doc = Document.from_string("# A\n");
+  const { hash } = doc.read_region("a");
+  doc.stabilize_region({ id: "a", stable_id: "custom-id", expected_hash: hash });
+  assertEquals(doc.to_string().includes("<!-- mdr:id=custom-id -->"), true);
+  assertEquals(doc.read_region("custom-id").stable_id, "custom-id");
+});
+
+Deno.test("stabilize_region — stamps anchor above a code block", () => {
+  const doc = Document.from_string("```ts\nx\n```\n");
+  const { hash } = doc.read_region("#code-1");
+  doc.stabilize_region({ id: "#code-1", stable_id: "snip", expected_hash: hash });
+  assertEquals(doc.to_string(), "<!-- mdr:id=snip -->\n```ts\nx\n```\n");
+});
+
+Deno.test("stabilize_region — stamps anchor above a table", () => {
+  const doc = Document.from_string("| A | B |\n|---|---|\n| 1 | 2 |\n");
+  const { hash } = doc.read_region("#table-1");
+  doc.stabilize_region({ id: "#table-1", stable_id: "grid", expected_hash: hash });
+  assertEquals(
+    doc.to_string(),
+    "<!-- mdr:id=grid -->\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+  );
+});
+
+Deno.test("stabilize_region — rewriting an existing stable_id", () => {
+  const src = `## A <!-- mdr:id=old -->\n\nbody\n`;
+  const doc = Document.from_string(src);
+  const { hash } = doc.read_region("old");
+  doc.stabilize_region({ id: "old", stable_id: "new", expected_hash: hash });
+  assertEquals(
+    doc.to_string().startsWith("## A <!-- mdr:id=new -->"),
+    true,
+  );
+});
+
+Deno.test("stabilize_region — no-op when requested equals current", () => {
+  const src = `## A <!-- mdr:id=pinned -->\n\nbody\n`;
+  const doc = Document.from_string(src);
+  const before = doc.to_string();
+  const { hash } = doc.read_region("pinned");
+  const r = doc.stabilize_region({
+    id: "pinned",
+    stable_id: "pinned",
+    expected_hash: hash,
+  });
+  assertEquals("stable_id" in r, true);
+  assertEquals(doc.to_string(), before);
+});
+
+Deno.test("stabilize_region — Error: stable_id already in use elsewhere", () => {
+  const src = `## A <!-- mdr:id=taken -->\n\n## B\n`;
+  const doc = Document.from_string(src);
+  const { hash } = doc.read_region("b");
+  const r = doc.stabilize_region({
+    id: "b",
+    stable_id: "taken",
+    expected_hash: hash,
+  });
+  assertEquals("error" in r, true);
+});
+
+Deno.test("stabilize_region — Error: root has no stable_id", () => {
+  const doc = Document.from_string("# A\n");
+  const { hash } = doc.read_region("");
+  const r = doc.stabilize_region({ id: "", expected_hash: hash });
+  assertEquals("error" in r, true);
+});
+
+Deno.test("stabilize_region — Conflict on stale hash", () => {
+  const doc = Document.from_string("# A\n");
+  const r = doc.stabilize_region({ id: "a", expected_hash: "0".repeat(16) });
+  assertEquals("conflict" in r, true);
+});
