@@ -85,6 +85,15 @@ export interface ErrorResult {
 
 export type InsertResult = InsertOkResult | ConflictResult | ErrorResult;
 
+export interface TableConflictResult {
+  conflict: true;
+  current_table: { headers: string[]; rows: string[][] };
+  current_hash: string;
+  region_still_exists: boolean;
+}
+
+export type TableWriteResult = OkResult | TableConflictResult | ErrorResult;
+
 export class Document {
   #source!: string;
   // deno-lint-ignore no-explicit-any
@@ -502,6 +511,90 @@ export class Document {
     return { error: "set_title succeeded but new region could not be located" };
   }
 
+  update_cells(opts: {
+    id: string;
+    edits: { row: number; col: number; value: string }[];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    for (const e of opts.edits) {
+      if (e.row < 0 || e.row >= rows.length) {
+        return { error: `row out of range: ${e.row}` };
+      }
+      if (e.col < 0 || e.col >= headers.length) {
+        return { error: `col out of range: ${e.col}` };
+      }
+    }
+    const new_rows = rows.map((r) => r.slice());
+    for (const e of opts.edits) new_rows[e.row][e.col] = e.value;
+    return this.#apply_table_grid(region, headers, new_rows);
+  }
+
+  update_headers(opts: {
+    id: string;
+    edits: { col: number; value: string }[];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    for (const e of opts.edits) {
+      if (e.col < 0 || e.col >= headers.length) {
+        return { error: `col out of range: ${e.col}` };
+      }
+    }
+    const new_headers = headers.slice();
+    for (const e of opts.edits) new_headers[e.col] = e.value;
+    return this.#apply_table_grid(region, new_headers, rows);
+  }
+
+  #resolve_table(
+    id: string,
+    expected_hash: string,
+  ):
+    | { region: RegionData; headers: string[]; rows: string[][] }
+    | TableConflictResult
+    | ErrorResult {
+    const region = this.#regions.get(id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(id)}`);
+    }
+    if (region.type !== "table") {
+      throw new Error(`region is not a table: ${JSON.stringify(id)}`);
+    }
+    const headers = table_headers(region.ast_node);
+    const rows = table_rows(region.ast_node);
+    if (region.hash !== expected_hash) {
+      return {
+        conflict: true,
+        current_table: { headers, rows },
+        current_hash: region.hash,
+        region_still_exists: true,
+      };
+    }
+    return { region, headers, rows };
+  }
+
+  #apply_table_grid(
+    region: RegionData,
+    headers: string[],
+    rows: string[][],
+  ): OkResult {
+    const align = (region.ast_node.align ?? []) as (string | null)[];
+    const serialized = serialize_table(headers, rows, align);
+    const new_source = splice(
+      this.#source,
+      region.ast_node.position?.start.offset ?? region.range_start,
+      region.ast_node.position?.end.offset ?? region.range_end,
+      serialized,
+    );
+    this.#parse(new_source);
+    const updated = this.#regions.get(region.id);
+    return { hash: updated ? updated.hash : this.#root.hash };
+  }
+
   stabilize_region(opts: {
     id: string;
     stable_id?: string;
@@ -836,6 +929,37 @@ function collect_regions(
 function register(registry: Map<string, RegionData>, data: RegionData): void {
   registry.set(data.id, data);
   if (data.stable_id !== undefined) registry.set(data.stable_id, data);
+}
+
+function serialize_table(
+  headers: string[],
+  rows: string[][],
+  align: (string | null)[],
+): string {
+  const lines: string[] = [];
+  lines.push("| " + headers.map(escape_cell).join(" | ") + " |");
+  const sep = headers.map((_, i) => {
+    switch (align[i] ?? null) {
+      case "left":
+        return ":---";
+      case "right":
+        return "---:";
+      case "center":
+        return ":---:";
+      default:
+        return "---";
+    }
+  });
+  lines.push("| " + sep.join(" | ") + " |");
+  for (const row of rows) {
+    const padded = headers.map((_, i) => escape_cell(row[i] ?? ""));
+    lines.push("| " + padded.join(" | ") + " |");
+  }
+  return lines.join("\n") + "\n";
+}
+
+function escape_cell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
 function table_headers(table_node: AstNode): string[] {
