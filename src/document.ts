@@ -74,6 +74,17 @@ export interface FindErrorResult {
 
 export type EditResult = OkResult | ConflictResult | FindErrorResult;
 
+export interface InsertOkResult {
+  id: string;
+  hash: string;
+}
+
+export interface ErrorResult {
+  error: string;
+}
+
+export type InsertResult = InsertOkResult | ConflictResult | ErrorResult;
+
 export class Document {
   #source!: string;
   // deno-lint-ignore no-explicit-any
@@ -270,6 +281,156 @@ export class Document {
     return { hash: updated ? updated.hash : this.#root.hash };
   }
 
+  insert_region(opts: {
+    parent_id?: string;
+    after_child_id?: string;
+    content: string;
+    expected_hash: string;
+    stable_id?: string;
+  }): InsertResult {
+    const parent_id = opts.parent_id ?? "";
+
+    // Resolve parent: root or a section (tables/code have no children).
+    let parent_depth: number;
+    let parent_hash: string;
+    let parent_content: string;
+    let parent_content_start: number;
+    let parent_content_end: number;
+    if (parent_id === "") {
+      parent_depth = 0;
+      parent_hash = this.#root.hash;
+      parent_content = this.#root.content;
+      parent_content_start = 0;
+      parent_content_end = this.#source.length;
+    } else {
+      const p = this.#regions.get(parent_id);
+      if (!p) {
+        return { error: `parent not found: ${parent_id}` };
+      }
+      if (p.type !== "section") {
+        return { error: `parent is not a section: ${parent_id}` };
+      }
+      parent_depth = p.ast_node.depth ?? 1;
+      parent_hash = p.hash;
+      parent_content = p.content;
+      parent_content_start = p.content_range_start;
+      parent_content_end = p.content_range_end;
+    }
+
+    if (parent_hash !== opts.expected_hash) {
+      return {
+        conflict: true,
+        current_content: parent_content,
+        current_hash: parent_hash,
+        region_still_exists: true,
+      };
+    }
+
+    // Validate stable_id if provided.
+    if (opts.stable_id !== undefined) {
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(opts.stable_id)) {
+        return { error: `invalid stable_id format: ${opts.stable_id}` };
+      }
+      if (this.#regions.has(opts.stable_id)) {
+        return { error: `stable_id already in use: ${opts.stable_id}` };
+      }
+    }
+
+    // Parse the content and check shape: exactly one top-level region,
+    // starting with a heading / table / code fence.
+    const content_ast = processor.parse(opts.content);
+    const top_level = content_ast.children ?? [];
+    const region_like = top_level.filter((n: AstNode) =>
+      n.type === "heading" || n.type === "table" || n.type === "code"
+    );
+    if (region_like.length === 0) {
+      return { error: "content must begin with a heading, table, or code fence" };
+    }
+    // Find the first non-html/whitespace node; must be a region-like kind.
+    const first_substantive = top_level.find((n: AstNode) => n.type !== "html");
+    if (
+      !first_substantive ||
+      (first_substantive.type !== "heading" &&
+        first_substantive.type !== "table" &&
+        first_substantive.type !== "code")
+    ) {
+      return { error: "content must begin with a heading, table, or code fence" };
+    }
+    // Count top-level regions: for headings, only those at the shallowest
+    // depth count as top-level sections; tables/code blocks each count as one.
+    const heading_depths: number[] = top_level
+      .filter((n: AstNode) => n.type === "heading")
+      .map((n: AstNode) => n.depth as number);
+    const min_depth = heading_depths.length > 0 ? Math.min(...heading_depths) : Infinity;
+    const top_section_count = heading_depths.filter((d) => d === min_depth).length;
+    const top_table_or_code = top_level.filter(
+      (n: AstNode) => n.type === "table" || n.type === "code",
+    ).length;
+    const total_top = top_section_count + top_table_or_code;
+    if (total_top > 1) {
+      return { error: "content contains more than one top-level region" };
+    }
+
+    // Heading level normalization for section content.
+    let normalized = opts.content;
+    const first_type = first_substantive.type as "heading" | "table" | "code";
+    if (first_type === "heading") {
+      // deno-lint-ignore no-explicit-any
+      const leading_depth = (first_substantive as any).depth as number;
+      const target = parent_depth + 1;
+      const delta = target - leading_depth;
+      if (delta !== 0) {
+        normalized = shift_heading_levels(normalized, delta);
+      }
+    }
+
+    // Inject stable_id anchor.
+    if (opts.stable_id !== undefined) {
+      normalized = inject_anchor(normalized, opts.stable_id, first_type);
+    }
+
+    // Ensure trailing newline for clean splicing.
+    if (!normalized.endsWith("\n")) normalized += "\n";
+
+    // Compute insertion offset.
+    let insert_at: number;
+    if (opts.after_child_id !== undefined) {
+      const sibling = this.#regions.get(opts.after_child_id);
+      if (!sibling) {
+        return { error: `after_child_id not found: ${opts.after_child_id}` };
+      }
+      if (
+        sibling.range_start < parent_content_start ||
+        sibling.range_end > parent_content_end
+      ) {
+        return { error: `after_child_id is not a child of parent: ${opts.after_child_id}` };
+      }
+      insert_at = sibling.range_end;
+    } else {
+      insert_at = parent_content_start;
+    }
+
+    // Snapshot existing IDs so we can find the newly-inserted one.
+    const ids_before = new Set(this.#regions.keys());
+
+    const new_source = splice(this.#source, insert_at, insert_at, normalized);
+    this.#parse(new_source);
+
+    // Find the new region.
+    if (opts.stable_id !== undefined) {
+      const r = this.#regions.get(opts.stable_id);
+      if (r) return { id: r.id, hash: r.hash };
+    }
+    // Fallback: find the first newly-appeared region ID.
+    for (const [id, r] of this.#regions) {
+      if (!ids_before.has(id)) {
+        return { id: r.id, hash: r.hash };
+      }
+    }
+    // Nothing new detected — shouldn't happen in valid inserts.
+    return { error: "insert succeeded but new region could not be located" };
+  }
+
   #edit_root(opts: {
     find?: string;
     replacement: string;
@@ -335,6 +496,33 @@ function count_occurrences(haystack: string, needle: string): number {
     i += needle.length;
   }
   return count;
+}
+
+// Shift the depth of every ATX heading in `content` by `delta`. Applied at
+// line start with a trailing space or line end (so a bare '#tag' inline isn't
+// touched). Depth is clamped to [1, 6].
+function shift_heading_levels(content: string, delta: number): string {
+  return content.replace(/^(#{1,6})(?=[ \t]|$)/gm, (_m, hashes: string) => {
+    const new_depth = Math.max(1, Math.min(6, hashes.length + delta));
+    return "#".repeat(new_depth);
+  });
+}
+
+// Inject an anchor comment. For section content, append to the first heading
+// line. For tables and code blocks, prepend on its own line.
+function inject_anchor(
+  content: string,
+  stable_id: string,
+  kind: "heading" | "table" | "code",
+): string {
+  const anchor = `<!-- mdr:id=${stable_id} -->`;
+  if (kind === "heading") {
+    const nl = content.indexOf("\n");
+    const first_line = nl === -1 ? content : content.slice(0, nl);
+    const rest = nl === -1 ? "" : content.slice(nl);
+    return `${first_line.replace(/\s*$/, "")} ${anchor}${rest}`;
+  }
+  return `${anchor}\n${content}`;
 }
 
 function collect_regions(
