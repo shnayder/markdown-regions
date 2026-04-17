@@ -431,6 +431,77 @@ export class Document {
     return { error: "insert succeeded but new region could not be located" };
   }
 
+  set_title(opts: {
+    id: string;
+    title: string;
+    expected_hash: string;
+  }): InsertOkResult | ConflictResult | ErrorResult {
+    if (opts.id === "") {
+      return { error: "root has no title" };
+    }
+    const region = this.#regions.get(opts.id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(opts.id)}`);
+    }
+    if (region.type === "table") {
+      return { error: "tables have no title" };
+    }
+    if (region.hash !== opts.expected_hash) {
+      return {
+        conflict: true,
+        current_content: region.content,
+        current_hash: region.hash,
+        region_still_exists: true,
+      };
+    }
+    // Build a replacement for the heading/opener line and splice it in, leaving
+    // the body untouched.
+    let new_line: string;
+    let line_start: number;
+    let line_end: number;
+    if (region.type === "section") {
+      const depth = region.ast_node.depth as number;
+      const anchor = region.stable_id !== undefined ? ` <!-- mdr:id=${region.stable_id} -->` : "";
+      new_line = `${"#".repeat(depth)} ${opts.title}${anchor}`;
+      line_start = region.ast_node.position?.start.offset ?? region.range_start;
+      line_end = region.ast_node.position?.end.offset ?? region.content_range_start;
+    } else {
+      // code block: replace the fence opener line's language portion only.
+      const node_start = region.ast_node.position?.start.offset ?? region.range_start;
+      const opener_nl = this.#source.indexOf("\n", node_start);
+      const opener_end = opener_nl === -1 ? this.#source.length : opener_nl;
+      const opener = this.#source.slice(node_start, opener_end);
+      const fence_match = opener.match(/^([`~]+)/);
+      if (!fence_match) {
+        return { error: "could not locate code fence" };
+      }
+      const fence = fence_match[1];
+      new_line = `${fence}${opts.title}`;
+      line_start = node_start;
+      line_end = opener_end;
+    }
+    const new_source = splice(this.#source, line_start, line_end, new_line);
+    // Track whether we can still resolve the region after re-parse (slug for a
+    // section can change; stable_id or code's '#code-N' stays put).
+    const preferred_id = region.stable_id ?? opts.id;
+    this.#parse(new_source);
+    const updated = this.#regions.get(preferred_id) ??
+      (opts.id !== preferred_id ? this.#regions.get(opts.id) : undefined);
+    if (updated) return { id: updated.id, hash: updated.hash };
+    // Section rename without a stable_id: slug changed. Find the new region by
+    // locating the heading line we just wrote.
+    if (region.type === "section") {
+      const new_slug = slugify(opts.title);
+      // Scan for the slug-derived ID somewhere in the tree (prefix-agnostic).
+      for (const [id, r] of this.#regions) {
+        if (id === new_slug || id.endsWith(`/${new_slug}`)) {
+          if (r.hash !== region.hash) return { id: r.id, hash: r.hash };
+        }
+      }
+    }
+    return { error: "set_title succeeded but new region could not be located" };
+  }
+
   #edit_root(opts: {
     find?: string;
     replacement: string;

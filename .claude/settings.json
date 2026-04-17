@@ -8,7 +8,21 @@
       "Bash(deno lint *)",
       "Bash(deno run *)",
       "Bash(deno task *)",
-      "Bash(deno cache *)"
+      "Bash(deno cache *)",
+
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(git fetch:*)",
+      "Bash(git commit:*)",
+      "Bash(test:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh run:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
