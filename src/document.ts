@@ -24,15 +24,64 @@ const processor = unified().use(remarkParse).use(remarkGfm);
 // format before they take effect — anything else is just a regular HTML comment.
 const ANCHOR_RE = /^<!--\s*mdr:id=([a-z0-9][a-z0-9-]*)\s*-->$/;
 
+// Richer internal record: everything needed for read/edit ops. Not exposed.
+interface RegionData {
+  id: string;
+  stable_id?: string;
+  type: "section" | "table" | "code";
+  title: string | null;
+  hash: string;
+  content: string;
+  range_start: number;
+  range_end: number;
+  ast_node: AstNode;
+}
+
+export interface ReadRegionResult {
+  title: string | null;
+  content: string;
+  hash: string;
+  stable_id?: string;
+}
+
+export interface ReadTableResult {
+  headers: string[];
+  rows: string[][];
+  hash: string;
+}
+
 export class Document {
   #source: string;
   #ast: AstNode;
   #tree: RegionNode;
+  #regions: Map<string, RegionData>;
+  #root: { content: string; hash: string };
 
   private constructor(source: string) {
     this.#source = source;
     this.#ast = processor.parse(source);
-    this.#tree = this.#build_tree();
+    this.#regions = new Map();
+    const children = collect_regions(
+      this.#ast.children,
+      0,
+      "",
+      this.#source,
+      this.#source.length,
+      this.#regions,
+    );
+    this.#root = {
+      content: source,
+      hash: compute_hash(source),
+    };
+    this.#tree = {
+      id: "",
+      type: "section",
+      title: null,
+      hash: this.#root.hash,
+      char_length: codepoint_length(source),
+      child_count: children.length,
+      children,
+    };
     validate_stable_ids(this.#tree);
   }
 
@@ -53,16 +102,35 @@ export class Document {
     return opts?.depth !== undefined ? truncate_depth(subtree, opts.depth) : subtree;
   }
 
-  #build_tree(): RegionNode {
-    const children = collect_regions(this.#ast.children, 0, "", this.#source);
+  read_region(id: string): ReadRegionResult {
+    if (id === "") {
+      return { title: null, content: this.#root.content, hash: this.#root.hash };
+    }
+    const region = this.#regions.get(id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(id)}`);
+    }
+    const out: ReadRegionResult = {
+      title: region.title,
+      content: region.content,
+      hash: region.hash,
+    };
+    if (region.stable_id !== undefined) out.stable_id = region.stable_id;
+    return out;
+  }
+
+  read_table(id: string): ReadTableResult {
+    const region = this.#regions.get(id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(id)}`);
+    }
+    if (region.type !== "table") {
+      throw new Error(`region is not a table: ${JSON.stringify(id)}`);
+    }
     return {
-      id: "",
-      type: "section",
-      title: null,
-      hash: compute_hash(this.#source),
-      char_length: codepoint_length(this.#source),
-      child_count: children.length,
-      children,
+      headers: table_headers(region.ast_node),
+      rows: table_rows(region.ast_node),
+      hash: region.hash,
     };
   }
 }
@@ -77,6 +145,8 @@ function collect_regions(
   parent_depth: number,
   parent_path: string,
   source: string,
+  scope_end: number,
+  registry: Map<string, RegionData>,
 ): RegionNode[] {
   const result: RegionNode[] = [];
   let table_idx = 1;
@@ -100,27 +170,57 @@ function collect_regions(
         j++;
       }
 
+      // Content extends until the next terminating heading (whose start
+      // offset marks the boundary), or — if we're the last sibling in this
+      // scope — to the end of the enclosing scope. Picking up the trailing
+      // whitespace between us and the next section matters for round-tripping.
+      const section_start = node.position?.start.offset ?? 0;
+      let content_start = node.position?.end.offset ?? section_start;
+      // remark's heading.end.offset stops at the heading text; advance past
+      // the heading line's terminator so "content" is everything after the line.
+      if (content_start < source.length && source[content_start] === "\n") {
+        content_start++;
+      }
+      const content_end = j < nodes.length
+        ? (nodes[j].position?.start.offset ?? scope_end)
+        : scope_end;
+
       const body = nodes.slice(i + 1, j);
       const slug = disambiguate(slugify(title), section_slugs_taken);
       section_slugs_taken.add(slug);
       const path = parent_path ? `${parent_path}/${slug}` : slug;
-      const children = collect_regions(body, section_depth, path, source);
+      const children = collect_regions(
+        body,
+        section_depth,
+        path,
+        source,
+        content_end,
+        registry,
+      );
 
-      // Canonical source for a section = heading line through end of body.
-      const section_start = node.position?.start.offset ?? 0;
-      const content_start = node.position?.end.offset ?? section_start;
-      const content_end = body.length > 0
-        ? body[body.length - 1].position?.end.offset ?? content_start
-        : content_start;
       const content = source.slice(content_start, content_end);
       const canonical = source.slice(section_start, content_end);
+      const hash = compute_hash(canonical);
+
+      const data: RegionData = {
+        id: path,
+        ...(stable_id ? { stable_id } : {}),
+        type: "section",
+        title,
+        hash,
+        content,
+        range_start: section_start,
+        range_end: content_end,
+        ast_node: node,
+      };
+      register(registry, data);
 
       result.push({
         id: path,
         ...(stable_id ? { stable_id } : {}),
         type: "section",
         title,
-        hash: compute_hash(canonical),
+        hash,
         char_length: codepoint_length(content),
         child_count: children.length,
         children,
@@ -130,39 +230,37 @@ function collect_regions(
       continue;
     }
 
-    if (node.type === "table") {
-      const id = `${parent_path}#table-${table_idx}`;
-      table_idx++;
+    if (node.type === "table" || node.type === "code") {
+      const is_table = node.type === "table";
+      const id = is_table
+        ? `${parent_path}#table-${table_idx++}`
+        : `${parent_path}#code-${code_idx++}`;
       const stable_id = preceding_anchor_id(nodes, i);
       const { start, end } = region_extent_with_anchor(nodes, i, stable_id !== undefined);
-      const content = source.slice(start, end);
-      result.push({
-        id,
-        ...(stable_id ? { stable_id } : {}),
-        type: "table",
-        title: null,
-        hash: compute_hash(content),
-        char_length: codepoint_length(content),
-        child_count: 0,
-        children: [],
-      });
-      i++;
-      continue;
-    }
+      const canonical = source.slice(start, end);
+      const content = is_table ? canonical : String(node.value ?? "");
+      const hash = compute_hash(canonical);
 
-    if (node.type === "code") {
-      const id = `${parent_path}#code-${code_idx}`;
-      code_idx++;
-      const stable_id = preceding_anchor_id(nodes, i);
-      const { start, end } = region_extent_with_anchor(nodes, i, stable_id !== undefined);
-      const content = source.slice(start, end);
+      const data: RegionData = {
+        id,
+        ...(stable_id ? { stable_id } : {}),
+        type: is_table ? "table" : "code",
+        title: is_table ? null : (node.lang ?? null),
+        hash,
+        content,
+        range_start: start,
+        range_end: end,
+        ast_node: node,
+      };
+      register(registry, data);
+
       result.push({
         id,
         ...(stable_id ? { stable_id } : {}),
-        type: "code",
-        title: node.lang ?? null,
-        hash: compute_hash(content),
-        char_length: codepoint_length(content),
+        type: is_table ? "table" : "code",
+        title: is_table ? null : (node.lang ?? null),
+        hash,
+        char_length: codepoint_length(canonical),
         child_count: 0,
         children: [],
       });
@@ -175,6 +273,24 @@ function collect_regions(
     i++;
   }
   return result;
+}
+
+function register(registry: Map<string, RegionData>, data: RegionData): void {
+  registry.set(data.id, data);
+  if (data.stable_id !== undefined) registry.set(data.stable_id, data);
+}
+
+function table_headers(table_node: AstNode): string[] {
+  const rows = table_node.children ?? [];
+  if (rows.length === 0) return [];
+  return (rows[0].children ?? []).map((cell: AstNode) => extract_text(cell).trim());
+}
+
+function table_rows(table_node: AstNode): string[][] {
+  const rows = table_node.children ?? [];
+  return rows.slice(1).map((row: AstNode) =>
+    (row.children ?? []).map((cell: AstNode) => extract_text(cell).trim())
+  );
 }
 
 function stable_id_in_heading(heading: AstNode): string | undefined {
