@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(deno --version)",
+      "Bash(deno test *)",
+      "Bash(deno check *)",
+      "Bash(deno fmt *)",
+      "Bash(deno lint *)",
+      "Bash(deno run *)",
+      "Bash(deno task *)",
+      "Bash(deno cache *)"
+    ]
+  }
+}
