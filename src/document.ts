@@ -32,8 +32,12 @@ interface RegionData {
   title: string | null;
   hash: string;
   content: string;
+  // Canonical source extent (used for hashing).
   range_start: number;
   range_end: number;
+  // Editable content extent (what edit_region splices over).
+  content_range_start: number;
+  content_range_end: number;
   ast_node: AstNode;
 }
 
@@ -50,14 +54,39 @@ export interface ReadTableResult {
   hash: string;
 }
 
+export interface OkResult {
+  hash: string;
+}
+
+export interface ConflictResult {
+  conflict: true;
+  current_content: string;
+  current_hash: string;
+  region_still_exists: boolean;
+}
+
+export interface FindErrorResult {
+  error: "find_not_found" | "find_ambiguous";
+  match_count?: number;
+  current_content: string;
+  current_hash: string;
+}
+
+export type EditResult = OkResult | ConflictResult | FindErrorResult;
+
 export class Document {
-  #source: string;
-  #ast: AstNode;
-  #tree: RegionNode;
-  #regions: Map<string, RegionData>;
-  #root: { content: string; hash: string };
+  #source!: string;
+  // deno-lint-ignore no-explicit-any
+  #ast!: any;
+  #tree!: RegionNode;
+  #regions!: Map<string, RegionData>;
+  #root!: { content: string; hash: string };
 
   private constructor(source: string) {
+    this.#parse(source);
+  }
+
+  #parse(source: string): void {
     this.#source = source;
     this.#ast = processor.parse(source);
     this.#regions = new Map();
@@ -65,8 +94,8 @@ export class Document {
       this.#ast.children,
       0,
       "",
-      this.#source,
-      this.#source.length,
+      source,
+      source.length,
       this.#regions,
     );
     this.#root = {
@@ -133,11 +162,119 @@ export class Document {
       hash: region.hash,
     };
   }
+
+  edit_region(opts: {
+    id: string;
+    find?: string;
+    replacement: string;
+    expected_hash: string;
+  }): EditResult {
+    // Root is addressed separately — no entry in the regions map.
+    if (opts.id === "") {
+      return this.#edit_root(opts);
+    }
+    const region = this.#regions.get(opts.id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(opts.id)}`);
+    }
+    if (region.hash !== opts.expected_hash) {
+      return {
+        conflict: true,
+        current_content: region.content,
+        current_hash: region.hash,
+        region_still_exists: true,
+      };
+    }
+    const new_content_or_err = resolve_new_content(region.content, opts);
+    if ("error" in new_content_or_err) {
+      return {
+        ...new_content_or_err,
+        current_content: region.content,
+        current_hash: region.hash,
+      };
+    }
+    const new_source = splice(
+      this.#source,
+      region.content_range_start,
+      region.content_range_end,
+      new_content_or_err.new_content,
+    );
+    this.#parse(new_source);
+    const updated = this.#regions.get(opts.id);
+    if (!updated) {
+      // Shouldn't normally happen — find/replace in body doesn't change section
+      // IDs. If it does (e.g., whole-body edit with no heading), fall back to
+      // the new root hash.
+      return { hash: this.#root.hash };
+    }
+    return { hash: updated.hash };
+  }
+
+  #edit_root(opts: {
+    find?: string;
+    replacement: string;
+    expected_hash: string;
+  }): EditResult {
+    if (this.#root.hash !== opts.expected_hash) {
+      return {
+        conflict: true,
+        current_content: this.#root.content,
+        current_hash: this.#root.hash,
+        region_still_exists: true,
+      };
+    }
+    const new_content_or_err = resolve_new_content(this.#root.content, opts);
+    if ("error" in new_content_or_err) {
+      return {
+        ...new_content_or_err,
+        current_content: this.#root.content,
+        current_hash: this.#root.hash,
+      };
+    }
+    this.#parse(new_content_or_err.new_content);
+    return { hash: this.#root.hash };
+  }
 }
 
 function compute_hash(canonical: string): string {
   const digest = sha256(new TextEncoder().encode(canonical));
   return bytesToHex(digest).slice(0, 16);
+}
+
+function splice(source: string, start: number, end: number, replacement: string): string {
+  return source.slice(0, start) + replacement + source.slice(end);
+}
+
+// Apply find/replace or whole-body substitution, surfacing FindError cases.
+// Returns the new content on success, or { error, match_count? } on failure —
+// the caller adds current_content/current_hash from the region.
+function resolve_new_content(
+  content: string,
+  opts: { find?: string; replacement: string },
+):
+  | { new_content: string }
+  | { error: "find_not_found" | "find_ambiguous"; match_count?: number } {
+  if (opts.find === undefined) {
+    return { new_content: opts.replacement };
+  }
+  const count = count_occurrences(content, opts.find);
+  if (count === 0) return { error: "find_not_found" };
+  if (count > 1) return { error: "find_ambiguous", match_count: count };
+  const idx = content.indexOf(opts.find);
+  return {
+    new_content: content.slice(0, idx) + opts.replacement + content.slice(idx + opts.find.length),
+  };
+}
+
+function count_occurrences(haystack: string, needle: string): number {
+  if (needle === "") return 0;
+  let count = 0;
+  let i = 0;
+  while ((i = haystack.indexOf(needle, i)) !== -1) {
+    count++;
+    i += needle.length;
+  }
+  return count;
 }
 
 function collect_regions(
@@ -211,6 +348,8 @@ function collect_regions(
         content,
         range_start: section_start,
         range_end: content_end,
+        content_range_start: content_start,
+        content_range_end: content_end,
         ast_node: node,
       };
       register(registry, data);
@@ -241,6 +380,28 @@ function collect_regions(
       const content = is_table ? canonical : String(node.value ?? "");
       const hash = compute_hash(canonical);
 
+      // Content range: full canonical for tables; for code, locate node.value
+      // inside the fenced block so edits splice the body without disturbing the
+      // fence.
+      let content_range_start: number;
+      let content_range_end: number;
+      if (is_table) {
+        content_range_start = start;
+        content_range_end = end;
+      } else {
+        const node_start = node.position?.start.offset ?? start;
+        const node_end = node.position?.end.offset ?? end;
+        const idx = source.indexOf(content, node_start);
+        if (idx !== -1 && idx + content.length <= node_end) {
+          content_range_start = idx;
+          content_range_end = idx + content.length;
+        } else {
+          // Fallback: treat whole node as content (indented code, or parser quirk).
+          content_range_start = node_start;
+          content_range_end = node_end;
+        }
+      }
+
       const data: RegionData = {
         id,
         ...(stable_id ? { stable_id } : {}),
@@ -250,6 +411,8 @@ function collect_regions(
         content,
         range_start: start,
         range_end: end,
+        content_range_start,
+        content_range_end,
         ast_node: node,
       };
       register(registry, data);
