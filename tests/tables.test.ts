@@ -238,3 +238,105 @@ Deno.test("delete_rows — out-of-range index errors", () => {
   });
   assertEquals("error" in r, true);
 });
+
+Deno.test("insert_columns — append column with per-row values", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_columns({
+    id: "#table-1",
+    after_col: 1,
+    headers: ["Owner"],
+    cells: [["Alice"], ["Bob"]],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.headers, ["Name", "Status", "Owner"]);
+  assertEquals(after.rows, [
+    ["Alice", "todo", "Alice"],
+    ["Bob", "todo", "Bob"],
+  ]);
+});
+
+Deno.test("insert_columns — prepend at left (after_col = -1) with empty cells", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_columns({
+    id: "#table-1",
+    after_col: -1,
+    headers: ["#"],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.headers, ["#", "Name", "Status"]);
+  assertEquals(after.rows, [
+    ["", "Alice", "todo"],
+    ["", "Bob", "todo"],
+  ]);
+});
+
+Deno.test("insert_columns — multiple columns at once", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.insert_columns({
+    id: "#table-1",
+    after_col: 1,
+    headers: ["A", "B"],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.headers, ["Name", "Status", "A", "B"]);
+  assertEquals(after.rows[0], ["Alice", "todo", "", ""]);
+});
+
+Deno.test("insert_columns — out-of-range after_col errors", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  const r = doc.insert_columns({
+    id: "#table-1",
+    after_col: 99,
+    headers: ["X"],
+    expected_hash: hash,
+  });
+  assertEquals("error" in r, true);
+});
+
+Deno.test("delete_columns — remove a column", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  doc.delete_columns({
+    id: "#table-1",
+    col_indices: [1],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.headers, ["Name"]);
+  assertEquals(after.rows, [["Alice"], ["Bob"]]);
+});
+
+Deno.test("delete_columns — multiple columns atomically", () => {
+  const src = `| a | b | c | d |
+|---|---|---|---|
+| 1 | 2 | 3 | 4 |
+`;
+  const doc = Document.from_string(src);
+  const { hash } = doc.read_table("#table-1");
+  doc.delete_columns({
+    id: "#table-1",
+    col_indices: [0, 2],
+    expected_hash: hash,
+  });
+  const after = doc.read_table("#table-1");
+  assertEquals(after.headers, ["b", "d"]);
+  assertEquals(after.rows, [["2", "4"]]);
+});
+
+Deno.test("delete_columns — out-of-range errors", () => {
+  const doc = Document.from_string(TABLE);
+  const { hash } = doc.read_table("#table-1");
+  const r = doc.delete_columns({
+    id: "#table-1",
+    col_indices: [99],
+    expected_hash: hash,
+  });
+  assertEquals("error" in r, true);
+});

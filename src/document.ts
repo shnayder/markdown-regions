@@ -552,6 +552,52 @@ export class Document {
     return this.#apply_table_grid(region, headers, new_rows);
   }
 
+  insert_columns(opts: {
+    id: string;
+    after_col: number;
+    headers: string[];
+    cells?: string[][];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    if (opts.after_col < -1 || opts.after_col > headers.length) {
+      return { error: `after_col out of range: ${opts.after_col}` };
+    }
+    const new_cols_count = opts.headers.length;
+    const insert_pos = opts.after_col + 1;
+    const new_headers = headers.slice();
+    new_headers.splice(insert_pos, 0, ...opts.headers);
+    const new_rows = rows.map((row, row_idx) => {
+      const new_cells = opts.cells?.[row_idx] ?? new Array(new_cols_count).fill("");
+      const normalized = opts.headers.map((_, i) => new_cells[i] ?? "");
+      const r = row.slice();
+      r.splice(insert_pos, 0, ...normalized);
+      return r;
+    });
+    return this.#apply_table_grid(region, new_headers, new_rows);
+  }
+
+  delete_columns(opts: {
+    id: string;
+    col_indices: number[];
+    expected_hash: string;
+  }): TableWriteResult {
+    const t = this.#resolve_table(opts.id, opts.expected_hash);
+    if ("error" in t || "conflict" in t) return t;
+    const { region, headers, rows } = t;
+    for (const c of opts.col_indices) {
+      if (c < 0 || c >= headers.length) {
+        return { error: `col out of range: ${c}` };
+      }
+    }
+    const drop = new Set(opts.col_indices);
+    const new_headers = headers.filter((_, i) => !drop.has(i));
+    const new_rows = rows.map((r) => r.filter((_, i) => !drop.has(i)));
+    return this.#apply_table_grid(region, new_headers, new_rows);
+  }
+
   delete_rows(opts: {
     id: string;
     row_indices: number[];
