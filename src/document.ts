@@ -58,6 +58,7 @@ function collect_regions(
   const result: RegionNode[] = [];
   let table_idx = 1;
   let code_idx = 1;
+  const section_slugs_taken = new Set<string>();
   let i = 0;
 
   while (i < nodes.length) {
@@ -76,7 +77,8 @@ function collect_regions(
       }
 
       const body = nodes.slice(i + 1, j);
-      const slug = slugify(title);
+      const slug = disambiguate(slugify(title), section_slugs_taken);
+      section_slugs_taken.add(slug);
       const path = parent_path ? `${parent_path}/${slug}` : slug;
       const children = collect_regions(body, section_depth, path, source);
 
@@ -160,6 +162,15 @@ function slugify(title: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+// Per spec: if raw is already taken, try raw-2, raw-3, ... until a free slot.
+// The suffixed form may itself collide with a raw slug elsewhere, hence the loop.
+function disambiguate(raw: string, taken: Set<string>): string {
+  if (!taken.has(raw)) return raw;
+  let n = 2;
+  while (taken.has(`${raw}-${n}`)) n++;
+  return `${raw}-${n}`;
 }
 
 function codepoint_length(s: string): number {
