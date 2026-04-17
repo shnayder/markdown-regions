@@ -1,6 +1,7 @@
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
+import remarkFrontmatter from "remark-frontmatter";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 
@@ -18,7 +19,10 @@ export interface RegionNode {
 // deno-lint-ignore no-explicit-any
 type AstNode = any;
 
-const processor = unified().use(remarkParse).use(remarkGfm);
+const processor = unified()
+  .use(remarkParse)
+  .use(remarkGfm)
+  .use(remarkFrontmatter, ["yaml", "toml"]);
 
 // Anchor comment format: <!-- mdr:id=<slug> -->. Stable IDs must match the
 // format before they take effect — anything else is just a regular HTML comment.
