@@ -210,6 +210,66 @@ export class Document {
     return { hash: updated.hash };
   }
 
+  append_region(opts: {
+    id: string;
+    content: string;
+    expected_hash: string;
+  }): OkResult | ConflictResult {
+    return this.#at_boundary(opts.id, opts.expected_hash, "end", opts.content);
+  }
+
+  prepend_region(opts: {
+    id: string;
+    content: string;
+    expected_hash: string;
+  }): OkResult | ConflictResult {
+    return this.#at_boundary(opts.id, opts.expected_hash, "start", opts.content);
+  }
+
+  #at_boundary(
+    id: string,
+    expected_hash: string,
+    where: "start" | "end",
+    content: string,
+  ): OkResult | ConflictResult {
+    // Root: insert at 0 (start) or source.length (end).
+    if (id === "") {
+      if (this.#root.hash !== expected_hash) {
+        return {
+          conflict: true,
+          current_content: this.#root.content,
+          current_hash: this.#root.hash,
+          region_still_exists: true,
+        };
+      }
+      const new_source = where === "end" ? this.#source + content : content + this.#source;
+      this.#parse(new_source);
+      return { hash: this.#root.hash };
+    }
+    const region = this.#regions.get(id);
+    if (!region) {
+      throw new Error(`region not found: ${JSON.stringify(id)}`);
+    }
+    if (region.type === "table") {
+      throw new Error(
+        `append/prepend not applicable to tables — use insert_rows`,
+      );
+    }
+    if (region.hash !== expected_hash) {
+      return {
+        conflict: true,
+        current_content: region.content,
+        current_hash: region.hash,
+        region_still_exists: true,
+      };
+    }
+    const at = where === "end" ? region.content_range_end : region.content_range_start;
+    const new_source = splice(this.#source, at, at, content);
+    this.#parse(new_source);
+    const updated = this.#regions.get(id);
+    return { hash: updated ? updated.hash : this.#root.hash };
+  }
+
   #edit_root(opts: {
     find?: string;
     replacement: string;
