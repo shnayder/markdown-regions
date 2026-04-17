@@ -1,6 +1,8 @@
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
+import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 
 export interface RegionNode {
   id: string;
@@ -57,12 +59,17 @@ export class Document {
       id: "",
       type: "section",
       title: null,
-      hash: "",
+      hash: compute_hash(this.#source),
       char_length: codepoint_length(this.#source),
       child_count: children.length,
       children,
     };
   }
+}
+
+function compute_hash(canonical: string): string {
+  const digest = sha256(new TextEncoder().encode(canonical));
+  return bytesToHex(digest).slice(0, 16);
 }
 
 function collect_regions(
@@ -99,18 +106,21 @@ function collect_regions(
       const path = parent_path ? `${parent_path}/${slug}` : slug;
       const children = collect_regions(body, section_depth, path, source);
 
-      const content_start = node.position?.end.offset ?? 0;
+      // Canonical source for a section = heading line through end of body.
+      const section_start = node.position?.start.offset ?? 0;
+      const content_start = node.position?.end.offset ?? section_start;
       const content_end = body.length > 0
         ? body[body.length - 1].position?.end.offset ?? content_start
         : content_start;
       const content = source.slice(content_start, content_end);
+      const canonical = source.slice(section_start, content_end);
 
       result.push({
         id: path,
         ...(stable_id ? { stable_id } : {}),
         type: "section",
         title,
-        hash: "",
+        hash: compute_hash(canonical),
         char_length: codepoint_length(content),
         child_count: children.length,
         children,
@@ -131,7 +141,7 @@ function collect_regions(
         ...(stable_id ? { stable_id } : {}),
         type: "table",
         title: null,
-        hash: "",
+        hash: compute_hash(content),
         char_length: codepoint_length(content),
         child_count: 0,
         children: [],
@@ -151,7 +161,7 @@ function collect_regions(
         ...(stable_id ? { stable_id } : {}),
         type: "code",
         title: node.lang ?? null,
-        hash: "",
+        hash: compute_hash(content),
         char_length: codepoint_length(content),
         child_count: 0,
         children: [],
