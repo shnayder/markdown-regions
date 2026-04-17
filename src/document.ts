@@ -111,6 +111,9 @@ export class Document {
   }
 
   #parse(source: string): void {
+    // Normalize line endings to \n on every parse so CRLF input (and edits
+    // that splice CRLF back in) hash and round-trip identically to LF.
+    source = source.replace(/\r\n?/g, "\n");
     this.#source = source;
     this.#ast = processor.parse(source);
     this.#regions = new Map();
